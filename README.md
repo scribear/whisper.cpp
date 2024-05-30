@@ -107,4 +107,6 @@ To build whisper, go into `whisper.cpp/` and do:
 ```
 mkdir build & cd build
 emcmake cmake ..
+make
 ```
+(WIP)
