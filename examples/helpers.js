@@ -8,7 +8,7 @@ function convertTypedArray(src, type) {
 
 var printTextarea = (function() {
     var element = document.getElementById('output');
-    if (element) element.alue = ''; // clear browser cache
+    if (element) element.value = ''; // clear browser cache
     return function(text) {
         if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
         console.log(text);
@@ -22,6 +22,7 @@ var printTextarea = (function() {
 async function clearCache() {
     if (confirm('Are you sure you want to clear the cache?\nAll the models will be downloaded again.')) {
         indexedDB.deleteDatabase(dbName);
+        location.reload();
     }
 }
 
@@ -33,9 +34,6 @@ async function fetchRemote(url, cbProgress, cbPrint) {
         url,
         {
             method: 'GET',
-            headers: {
-                'Content-Type': 'application/octet-stream',
-            },
         }
     );
 
@@ -88,11 +86,15 @@ async function fetchRemote(url, cbProgress, cbPrint) {
 // - check if the data is already in the IndexedDB
 // - if not, fetch it from the remote URL and store it in the IndexedDB
 function loadRemote(url, dst, size_mb, cbProgress, cbReady, cbCancel, cbPrint) {
-    // query the storage quota and print it
-    navigator.storage.estimate().then(function (estimate) {
-        cbPrint('loadRemote: storage quota: ' + estimate.quota + ' bytes');
-        cbPrint('loadRemote: storage usage: ' + estimate.usage + ' bytes');
-    });
+    if (!navigator.storage || !navigator.storage.estimate) {
+        cbPrint('loadRemote: navigator.storage.estimate() is not supported');
+    } else {
+        // query the storage quota and print it
+        navigator.storage.estimate().then(function (estimate) {
+            cbPrint('loadRemote: storage quota: ' + estimate.quota + ' bytes');
+            cbPrint('loadRemote: storage usage: ' + estimate.usage + ' bytes');
+        });
+    }
 
     // check if the data is already in the IndexedDB
     var rq = indexedDB.open(dbName, dbVersion);
@@ -141,7 +143,15 @@ function loadRemote(url, dst, size_mb, cbProgress, cbReady, cbCancel, cbPrint) {
                             var db = event.target.result;
                             var tx = db.transaction(['models'], 'readwrite');
                             var os = tx.objectStore('models');
-                            var rq = os.put(data, url);
+
+                            var rq = null;
+                            try {
+                                var rq = os.put(data, url);
+                            } catch (e) {
+                                cbPrint('loadRemote: failed to store "' + url + '" in the IndexedDB: \n' + e);
+                                cbCancel();
+                                return;
+                            }
 
                             rq.onsuccess = function (event) {
                                 cbPrint('loadRemote: "' + url + '" stored in the IndexedDB');
@@ -176,7 +186,6 @@ function loadRemote(url, dst, size_mb, cbProgress, cbReady, cbCancel, cbPrint) {
 
     rq.onabort = function (event) {
         cbPrint('loadRemote: failed to open IndexedDB: abort');
-
+        cbCancel();
     };
 }
-

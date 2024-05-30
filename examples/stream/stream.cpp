@@ -2,11 +2,9 @@
 //
 // A very quick-n-dirty implementation serving mainly as a proof of concept.
 //
-
+#include "common-sdl.h"
+#include "common.h"
 #include "whisper.h"
-
-#include <SDL.h>
-#include <SDL_audio.h>
 
 #include <cassert>
 #include <cstdio>
@@ -14,21 +12,7 @@
 #include <thread>
 #include <vector>
 #include <fstream>
-#include <mutex>
 
-//  500 -> 00:05.000
-// 6000 -> 01:00.000
-std::string to_timestamp(int64_t t) {
-    int64_t sec = t/100;
-    int64_t msec = t - sec*100;
-    int64_t min = sec/60;
-    sec = sec - min*60;
-
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%02d:%02d.%03d", (int) min, (int) sec, (int) msec);
-
-    return std::string(buf);
-}
 
 // command-line parameters
 struct whisper_params {
@@ -45,13 +29,18 @@ struct whisper_params {
 
     bool speed_up      = false;
     bool translate     = false;
+    bool no_fallback   = false;
     bool print_special = false;
     bool no_context    = true;
     bool no_timestamps = false;
+    bool tinydiarize   = false;
+    bool save_audio    = false; // save audio to wav file
+    bool use_gpu       = true;
+    bool flash_attn    = false;
 
     std::string language  = "en";
     std::string model     = "models/ggml-base.en.bin";
-    std::string fname_out = "";
+    std::string fname_out;
 };
 
 void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
@@ -64,22 +53,28 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
             whisper_print_usage(argc, argv, params);
             exit(0);
         }
-        else if (arg == "-t"   || arg == "--threads")       { params.n_threads     = std::stoi(argv[++i]); }
-        else if (                 arg == "--step")          { params.step_ms       = std::stoi(argv[++i]); }
-        else if (                 arg == "--length")        { params.length_ms     = std::stoi(argv[++i]); }
-        else if (                 arg == "--keep")          { params.keep_ms       = std::stoi(argv[++i]); }
-        else if (arg == "-c"   || arg == "--capture")       { params.capture_id    = std::stoi(argv[++i]); }
-        else if (arg == "-mt"  || arg == "--max-tokens")    { params.max_tokens    = std::stoi(argv[++i]); }
-        else if (arg == "-ac"  || arg == "--audio-ctx")     { params.audio_ctx     = std::stoi(argv[++i]); }
-        else if (arg == "-vth" || arg == "--vad-thold")     { params.vad_thold     = std::stof(argv[++i]); }
-        else if (arg == "-fth" || arg == "--freq-thold")    { params.freq_thold    = std::stof(argv[++i]); }
-        else if (arg == "-su"  || arg == "--speed-up")      { params.speed_up      = true; }
-        else if (arg == "-tr"  || arg == "--translate")     { params.translate     = true; }
-        else if (arg == "-ps"  || arg == "--print-special") { params.print_special = true; }
-        else if (arg == "-kc"  || arg == "--keep-context")  { params.no_context    = false; }
-        else if (arg == "-l"   || arg == "--language")      { params.language      = argv[++i]; }
-        else if (arg == "-m"   || arg == "--model")         { params.model         = argv[++i]; }
-        else if (arg == "-f"   || arg == "--file")          { params.fname_out     = argv[++i]; }
+        else if (arg == "-t"    || arg == "--threads")       { params.n_threads     = std::stoi(argv[++i]); }
+        else if (                  arg == "--step")          { params.step_ms       = std::stoi(argv[++i]); }
+        else if (                  arg == "--length")        { params.length_ms     = std::stoi(argv[++i]); }
+        else if (                  arg == "--keep")          { params.keep_ms       = std::stoi(argv[++i]); }
+        else if (arg == "-c"    || arg == "--capture")       { params.capture_id    = std::stoi(argv[++i]); }
+        else if (arg == "-mt"   || arg == "--max-tokens")    { params.max_tokens    = std::stoi(argv[++i]); }
+        else if (arg == "-ac"   || arg == "--audio-ctx")     { params.audio_ctx     = std::stoi(argv[++i]); }
+        else if (arg == "-vth"  || arg == "--vad-thold")     { params.vad_thold     = std::stof(argv[++i]); }
+        else if (arg == "-fth"  || arg == "--freq-thold")    { params.freq_thold    = std::stof(argv[++i]); }
+        else if (arg == "-su"   || arg == "--speed-up")      { params.speed_up      = true; }
+        else if (arg == "-tr"   || arg == "--translate")     { params.translate     = true; }
+        else if (arg == "-nf"   || arg == "--no-fallback")   { params.no_fallback   = true; }
+        else if (arg == "-ps"   || arg == "--print-special") { params.print_special = true; }
+        else if (arg == "-kc"   || arg == "--keep-context")  { params.no_context    = false; }
+        else if (arg == "-l"    || arg == "--language")      { params.language      = argv[++i]; }
+        else if (arg == "-m"    || arg == "--model")         { params.model         = argv[++i]; }
+        else if (arg == "-f"    || arg == "--file")          { params.fname_out     = argv[++i]; }
+        else if (arg == "-tdrz" || arg == "--tinydiarize")   { params.tinydiarize   = true; }
+        else if (arg == "-sa"   || arg == "--save-audio")    { params.save_audio    = true; }
+        else if (arg == "-ng"   || arg == "--no-gpu")        { params.use_gpu       = false; }
+        else if (arg == "-fa"   || arg == "--flash-attn")    { params.flash_attn    = true; }
+
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             whisper_print_usage(argc, argv, params);
@@ -90,327 +85,34 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
     return true;
 }
 
-void whisper_print_usage(int argc, char ** argv, const whisper_params & params) {
+void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & params) {
     fprintf(stderr, "\n");
     fprintf(stderr, "usage: %s [options]\n", argv[0]);
     fprintf(stderr, "\n");
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h,       --help          [default] show this help message and exit\n");
-    fprintf(stderr, "  -t N,     --threads N     [%-7d] number of threads to use during computation\n", params.n_threads);
-    fprintf(stderr, "            --step N        [%-7d] audio step size in milliseconds\n",             params.step_ms);
-    fprintf(stderr, "            --length N      [%-7d] audio length in milliseconds\n",                params.length_ms);
-    fprintf(stderr, "            --keep N        [%-7d] audio to keep from previous step in ms\n",      params.keep_ms);
-    fprintf(stderr, "  -c ID,    --capture ID    [%-7d] capture device ID\n",                           params.capture_id);
-    fprintf(stderr, "  -mt N,    --max-tokens N  [%-7d] maximum number of tokens per audio chunk\n",    params.max_tokens);
-    fprintf(stderr, "  -ac N,    --audio-ctx N   [%-7d] audio context size (0 - all)\n",                params.audio_ctx);
-    fprintf(stderr, "  -vth N,   --vad-thold N   [%-7.2f] voice activity detection threshold\n",        params.vad_thold);
-    fprintf(stderr, "  -fth N,   --freq-thold N  [%-7.2f] high-pass frequency cutoff\n",                params.freq_thold);
-    fprintf(stderr, "  -su,      --speed-up      [%-7s] speed up audio by x2 (reduced accuracy)\n",     params.speed_up ? "true" : "false");
-    fprintf(stderr, "  -tr,      --translate     [%-7s] translate from source language to english\n",   params.translate ? "true" : "false");
-    fprintf(stderr, "  -ps,      --print-special [%-7s] print special tokens\n",                        params.print_special ? "true" : "false");
-    fprintf(stderr, "  -kc,      --keep-context  [%-7s] keep context between audio chunks\n",           params.no_context ? "false" : "true");
-    fprintf(stderr, "  -l LANG,  --language LANG [%-7s] spoken language\n",                             params.language.c_str());
-    fprintf(stderr, "  -m FNAME, --model FNAME   [%-7s] model path\n",                                  params.model.c_str());
-    fprintf(stderr, "  -f FNAME, --file FNAME    [%-7s] text output file name\n",                       params.fname_out.c_str());
+    fprintf(stderr, "  -t N,     --threads N     [%-7d] number of threads to use during computation\n",    params.n_threads);
+    fprintf(stderr, "            --step N        [%-7d] audio step size in milliseconds\n",                params.step_ms);
+    fprintf(stderr, "            --length N      [%-7d] audio length in milliseconds\n",                   params.length_ms);
+    fprintf(stderr, "            --keep N        [%-7d] audio to keep from previous step in ms\n",         params.keep_ms);
+    fprintf(stderr, "  -c ID,    --capture ID    [%-7d] capture device ID\n",                              params.capture_id);
+    fprintf(stderr, "  -mt N,    --max-tokens N  [%-7d] maximum number of tokens per audio chunk\n",       params.max_tokens);
+    fprintf(stderr, "  -ac N,    --audio-ctx N   [%-7d] audio context size (0 - all)\n",                   params.audio_ctx);
+    fprintf(stderr, "  -vth N,   --vad-thold N   [%-7.2f] voice activity detection threshold\n",           params.vad_thold);
+    fprintf(stderr, "  -fth N,   --freq-thold N  [%-7.2f] high-pass frequency cutoff\n",                   params.freq_thold);
+    fprintf(stderr, "  -su,      --speed-up      [%-7s] speed up audio by x2 (reduced accuracy)\n",        params.speed_up ? "true" : "false");
+    fprintf(stderr, "  -tr,      --translate     [%-7s] translate from source language to english\n",      params.translate ? "true" : "false");
+    fprintf(stderr, "  -nf,      --no-fallback   [%-7s] do not use temperature fallback while decoding\n", params.no_fallback ? "true" : "false");
+    fprintf(stderr, "  -ps,      --print-special [%-7s] print special tokens\n",                           params.print_special ? "true" : "false");
+    fprintf(stderr, "  -kc,      --keep-context  [%-7s] keep context between audio chunks\n",              params.no_context ? "false" : "true");
+    fprintf(stderr, "  -l LANG,  --language LANG [%-7s] spoken language\n",                                params.language.c_str());
+    fprintf(stderr, "  -m FNAME, --model FNAME   [%-7s] model path\n",                                     params.model.c_str());
+    fprintf(stderr, "  -f FNAME, --file FNAME    [%-7s] text output file name\n",                          params.fname_out.c_str());
+    fprintf(stderr, "  -tdrz,    --tinydiarize   [%-7s] enable tinydiarize (requires a tdrz model)\n",     params.tinydiarize ? "true" : "false");
+    fprintf(stderr, "  -sa,      --save-audio    [%-7s] save the recorded audio to a file\n",              params.save_audio ? "true" : "false");
+    fprintf(stderr, "  -ng,      --no-gpu        [%-7s] disable GPU inference\n",                          params.use_gpu ? "false" : "true");
+    fprintf(stderr, "  -fa,      --flash-attn    [%-7s] flash attention during inference\n",               params.flash_attn ? "true" : "false");
     fprintf(stderr, "\n");
-}
-
-//
-// SDL Audio capture
-//
-
-class audio_async {
-public:
-    audio_async(int len_ms);
-    ~audio_async();
-
-    bool init(int capture_id, int sample_rate);
-
-    // start capturing audio via the provided SDL callback
-    // keep last len_ms seconds of audio in a circular buffer
-    bool resume();
-    bool pause();
-    bool clear();
-
-    // callback to be called by SDL
-    void callback(uint8_t * stream, int len);
-
-    // get audio data from the circular buffer
-    void get(int ms, std::vector<float> & audio);
-
-private:
-    SDL_AudioDeviceID m_dev_id_in = 0;
-
-    int m_len_ms = 0;
-    int m_sample_rate = 0;
-
-    bool       m_running = false;
-    std::mutex m_mutex;
-
-    std::vector<float> m_audio;
-    std::vector<float> m_audio_new;
-    size_t             m_audio_pos = 0;
-    size_t             m_audio_len = 0;
-};
-
-audio_async::audio_async(int len_ms) {
-    m_len_ms = len_ms;
-}
-
-audio_async::~audio_async() {
-    if (m_dev_id_in) {
-        SDL_CloseAudioDevice(m_dev_id_in);
-    }
-}
-
-bool audio_async::init(int capture_id, int sample_rate) {
-    SDL_LogSetPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO);
-
-    if (SDL_Init(SDL_INIT_AUDIO) < 0) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Couldn't initialize SDL: %s\n", SDL_GetError());
-        return false;
-    }
-
-    SDL_SetHintWithPriority(SDL_HINT_AUDIO_RESAMPLING_MODE, "medium", SDL_HINT_OVERRIDE);
-
-    {
-        int nDevices = SDL_GetNumAudioDevices(SDL_TRUE);
-        fprintf(stderr, "%s: found %d capture devices:\n", __func__, nDevices);
-        for (int i = 0; i < nDevices; i++) {
-            fprintf(stderr, "%s:    - Capture device #%d: '%s'\n", __func__, i, SDL_GetAudioDeviceName(i, SDL_TRUE));
-        }
-    }
-
-    SDL_AudioSpec capture_spec_requested;
-    SDL_AudioSpec capture_spec_obtained;
-
-    SDL_zero(capture_spec_requested);
-    SDL_zero(capture_spec_obtained);
-
-    capture_spec_requested.freq     = sample_rate;
-    capture_spec_requested.format   = AUDIO_F32;
-    capture_spec_requested.channels = 1;
-    capture_spec_requested.samples  = 1024;
-    capture_spec_requested.callback = [](void * userdata, uint8_t * stream, int len) {
-        audio_async * audio = (audio_async *) userdata;
-        audio->callback(stream, len);
-    };
-    capture_spec_requested.userdata = this;
-
-    if (capture_id >= 0) {
-        fprintf(stderr, "%s: attempt to open capture device %d : '%s' ...\n", __func__, capture_id, SDL_GetAudioDeviceName(capture_id, SDL_TRUE));
-        m_dev_id_in = SDL_OpenAudioDevice(SDL_GetAudioDeviceName(capture_id, SDL_TRUE), SDL_TRUE, &capture_spec_requested, &capture_spec_obtained, 0);
-    } else {
-        fprintf(stderr, "%s: attempt to open default capture device ...\n", __func__);
-        m_dev_id_in = SDL_OpenAudioDevice(nullptr, SDL_TRUE, &capture_spec_requested, &capture_spec_obtained, 0);
-    }
-
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: couldn't open an audio device for capture: %s!\n", __func__, SDL_GetError());
-        m_dev_id_in = 0;
-
-        return false;
-    } else {
-        fprintf(stderr, "%s: obtained spec for input device (SDL Id = %d):\n", __func__, m_dev_id_in);
-        fprintf(stderr, "%s:     - sample rate:       %d\n",                   __func__, capture_spec_obtained.freq);
-        fprintf(stderr, "%s:     - format:            %d (required: %d)\n",    __func__, capture_spec_obtained.format,
-                capture_spec_requested.format);
-        fprintf(stderr, "%s:     - channels:          %d (required: %d)\n",    __func__, capture_spec_obtained.channels,
-                capture_spec_requested.channels);
-        fprintf(stderr, "%s:     - samples per frame: %d\n",                   __func__, capture_spec_obtained.samples);
-    }
-
-    m_sample_rate = capture_spec_obtained.freq;
-
-    m_audio.resize((m_sample_rate*m_len_ms)/1000);
-
-    return true;
-}
-
-bool audio_async::resume() {
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: no audio device to resume!\n", __func__);
-        return false;
-    }
-
-    if (m_running) {
-        fprintf(stderr, "%s: already running!\n", __func__);
-        return false;
-    }
-
-    SDL_PauseAudioDevice(m_dev_id_in, 0);
-
-    m_running = true;
-
-    return true;
-}
-
-bool audio_async::pause() {
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: no audio device to pause!\n", __func__);
-        return false;
-    }
-
-    if (!m_running) {
-        fprintf(stderr, "%s: already paused!\n", __func__);
-        return false;
-    }
-
-    SDL_PauseAudioDevice(m_dev_id_in, 1);
-
-    m_running = false;
-
-    return true;
-}
-
-bool audio_async::clear() {
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: no audio device to clear!\n", __func__);
-        return false;
-    }
-
-    if (!m_running) {
-        fprintf(stderr, "%s: not running!\n", __func__);
-        return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        m_audio_pos = 0;
-        m_audio_len = 0;
-    }
-
-    return true;
-}
-
-// callback to be called by SDL
-void audio_async::callback(uint8_t * stream, int len) {
-    if (!m_running) {
-        return;
-    }
-
-    const size_t n_samples = len / sizeof(float);
-
-    m_audio_new.resize(n_samples);
-    memcpy(m_audio_new.data(), stream, n_samples * sizeof(float));
-
-    //fprintf(stderr, "%s: %zu samples, pos %zu, len %zu\n", __func__, n_samples, m_audio_pos, m_audio_len);
-
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        if (m_audio_pos + n_samples > m_audio.size()) {
-            const size_t n0 = m_audio.size() - m_audio_pos;
-
-            memcpy(&m_audio[m_audio_pos], stream, n0 * sizeof(float));
-            memcpy(&m_audio[0], &stream[n0], (n_samples - n0) * sizeof(float));
-
-            m_audio_pos = (m_audio_pos + n_samples) % m_audio.size();
-            m_audio_len = m_audio.size();
-        } else {
-            memcpy(&m_audio[m_audio_pos], stream, n_samples * sizeof(float));
-
-            m_audio_pos = (m_audio_pos + n_samples) % m_audio.size();
-            m_audio_len = std::min(m_audio_len + n_samples, m_audio.size());
-        }
-    }
-}
-
-void audio_async::get(int ms, std::vector<float> & result) {
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: no audio device to get audio from!\n", __func__);
-        return;
-    }
-
-    if (!m_running) {
-        fprintf(stderr, "%s: not running!\n", __func__);
-        return;
-    }
-
-    result.clear();
-
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        if (ms <= 0) {
-            ms = m_len_ms;
-        }
-
-        size_t n_samples = (m_sample_rate * ms) / 1000;
-        if (n_samples > m_audio_len) {
-            n_samples = m_audio_len;
-        }
-
-        result.resize(n_samples);
-
-        int s0 = m_audio_pos - n_samples;
-        if (s0 < 0) {
-            s0 += m_audio.size();
-        }
-
-        if (s0 + n_samples > m_audio.size()) {
-            const size_t n0 = m_audio.size() - s0;
-
-            memcpy(result.data(), &m_audio[s0], n0 * sizeof(float));
-            memcpy(&result[n0], &m_audio[0], (n_samples - n0) * sizeof(float));
-        } else {
-            memcpy(result.data(), &m_audio[s0], n_samples * sizeof(float));
-        }
-    }
-}
-
-///////////////////////////
-
-void high_pass_filter(std::vector<float> & data, float cutoff, float sample_rate) {
-    const float rc = 1.0f / (2.0f * M_PI * cutoff);
-    const float dt = 1.0f / sample_rate;
-    const float alpha = dt / (rc + dt);
-
-    float y = data[0];
-
-    for (size_t i = 1; i < data.size(); i++) {
-        y = alpha * (y + data[i] - data[i - 1]);
-        data[i] = y;
-    }
-}
-
-bool vad_simple(std::vector<float> & pcmf32, int sample_rate, int last_ms, float vad_thold, float freq_thold, bool verbose) {
-    const int n_samples      = pcmf32.size();
-    const int n_samples_last = (sample_rate * last_ms) / 1000;
-
-    if (n_samples_last >= n_samples) {
-        // not enough samples - assume no speech
-        return false;
-    }
-
-    if (freq_thold > 0.0f) {
-        high_pass_filter(pcmf32, freq_thold, sample_rate);
-    }
-
-    float energy_all  = 0.0f;
-    float energy_last = 0.0f;
-
-    for (size_t i = 0; i < n_samples; i++) {
-        energy_all += fabsf(pcmf32[i]);
-
-        if (i >= n_samples - n_samples_last) {
-            energy_last += fabsf(pcmf32[i]);
-        }
-    }
-
-    energy_all  /= n_samples;
-    energy_last /= n_samples_last;
-
-    if (verbose) {
-        fprintf(stderr, "%s: energy_all: %f, energy_last: %f, vad_thold: %f, freq_thold: %f\n", __func__, energy_all, energy_last, vad_thold, freq_thold);
-    }
-
-    if (energy_last > vad_thold*energy_all) {
-        return false;
-    }
-
-    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -420,20 +122,21 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    params.keep_ms = std::min(params.keep_ms, params.step_ms); // cannot be more than step_ms
+    params.keep_ms   = std::min(params.keep_ms,   params.step_ms);
+    params.length_ms = std::max(params.length_ms, params.step_ms);
 
-    const int n_samples_step = (params.step_ms  *1e-3)*WHISPER_SAMPLE_RATE;
-    const int n_samples_len  = (params.length_ms*1e-3)*WHISPER_SAMPLE_RATE;
-    const int n_samples_keep = (params.keep_ms  *1e-3)*WHISPER_SAMPLE_RATE;
-    const int n_samples_30s  = (30000           *1e-3)*WHISPER_SAMPLE_RATE;
+    const int n_samples_step = (1e-3*params.step_ms  )*WHISPER_SAMPLE_RATE;
+    const int n_samples_len  = (1e-3*params.length_ms)*WHISPER_SAMPLE_RATE;
+    const int n_samples_keep = (1e-3*params.keep_ms  )*WHISPER_SAMPLE_RATE;
+    const int n_samples_30s  = (1e-3*30000.0         )*WHISPER_SAMPLE_RATE;
 
-    const int n_new_line = params.length_ms / params.step_ms - 1; // number of steps to print new line
+    const bool use_vad = n_samples_step <= 0; // sliding window mode uses VAD
 
-    const bool use_vad = n_samples_step <= 0;
+    const int n_new_line = !use_vad ? std::max(1, params.length_ms / params.step_ms - 1) : 1; // number of steps to print new line
 
-    params.no_timestamps = !use_vad;
-    params.no_context    = use_vad;
-    params.max_tokens    = 0;
+    params.no_timestamps  = !use_vad;
+    params.no_context    |= use_vad;
+    params.max_tokens     = 0;
 
     // init audio
 
@@ -446,17 +149,21 @@ int main(int argc, char ** argv) {
     audio.resume();
 
     // whisper init
-
-    if (whisper_lang_id(params.language.c_str()) == -1) {
+    if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1){
         fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
         whisper_print_usage(argc, argv, params);
         exit(0);
     }
 
-    struct whisper_context * ctx = whisper_init(params.model.c_str());
+    struct whisper_context_params cparams = whisper_context_default_params();
+
+    cparams.use_gpu    = params.use_gpu;
+    cparams.flash_attn = params.flash_attn;
+
+    struct whisper_context * ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
 
     std::vector<float> pcmf32    (n_samples_30s, 0.0f);
-    std::vector<float> pcmf32_old(n_samples_30s, 0.0f);
+    std::vector<float> pcmf32_old;
     std::vector<float> pcmf32_new(n_samples_30s, 0.0f);
 
     std::vector<whisper_token> prompt_tokens;
@@ -483,7 +190,7 @@ int main(int argc, char ** argv) {
                 params.no_timestamps ? 0 : 1);
 
         if (!use_vad) {
-            fprintf(stderr, "%s: n_new_line = %d\n", __func__, n_new_line);
+            fprintf(stderr, "%s: n_new_line = %d, no_context = %d\n", __func__, n_new_line, params.no_context);
         } else {
             fprintf(stderr, "%s: using VAD, will transcribe on speech activity\n", __func__);
         }
@@ -504,32 +211,30 @@ int main(int argc, char ** argv) {
         }
     }
 
-    printf("[Start speaking]");
+    wav_writer wavWriter;
+    // save wav file
+    if (params.save_audio) {
+        // Get current date/time for filename
+        time_t now = time(0);
+        char buffer[80];
+        strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", localtime(&now));
+        std::string filename = std::string(buffer) + ".wav";
+
+        wavWriter.open(filename, WHISPER_SAMPLE_RATE, 16, 1);
+    }
+    printf("[Start speaking]\n");
     fflush(stdout);
 
-          auto t_last  = std::chrono::high_resolution_clock::now();
+    auto t_last  = std::chrono::high_resolution_clock::now();
     const auto t_start = t_last;
 
     // main audio loop
     while (is_running) {
-        // handle Ctrl + C
-        {
-            SDL_Event event;
-            while (SDL_PollEvent(&event)) {
-                switch (event.type) {
-                    case SDL_QUIT:
-                        {
-                            is_running = false;
-                        } break;
-                    default:
-                        break;
-                }
-            }
-
-            if (!is_running) {
-                break;
-            }
+        if (params.save_audio) {
+            wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
         }
+        // handle Ctrl + C
+        is_running = sdl_poll_events();
 
         if (!is_running) {
             break;
@@ -552,7 +257,7 @@ int main(int argc, char ** argv) {
                     break;
                 }
 
-                SDL_Delay(1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
             const int n_samples_new = pcmf32_new.size();
@@ -583,7 +288,7 @@ int main(int argc, char ** argv) {
 
             audio.get(2000, pcmf32_new);
 
-            if (vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
+            if (::vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
                 audio.get(params.length_ms, pcmf32);
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -603,7 +308,6 @@ int main(int argc, char ** argv) {
             wparams.print_realtime   = false;
             wparams.print_timestamps = !params.no_timestamps;
             wparams.translate        = params.translate;
-            wparams.no_context       = true;
             wparams.single_segment   = !use_vad;
             wparams.max_tokens       = params.max_tokens;
             wparams.language         = params.language.c_str();
@@ -611,6 +315,12 @@ int main(int argc, char ** argv) {
 
             wparams.audio_ctx        = params.audio_ctx;
             wparams.speed_up         = params.speed_up;
+
+            wparams.tdrz_enable      = params.tinydiarize; // [TDRZ]
+
+            // disable temperature fallback
+            //wparams.temperature_inc  = -1.0f;
+            wparams.temperature_inc  = params.no_fallback ? 0.0f : wparams.temperature_inc;
 
             wparams.prompt_tokens    = params.no_context ? nullptr : prompt_tokens.data();
             wparams.prompt_n_tokens  = params.no_context ? 0       : prompt_tokens.size();
@@ -653,10 +363,19 @@ int main(int argc, char ** argv) {
                         const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
                         const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
 
-                        printf ("[%s --> %s]  %s\n", to_timestamp(t0).c_str(), to_timestamp(t1).c_str(), text);
+                        std::string output = "[" + to_timestamp(t0, false) + " --> " + to_timestamp(t1, false) + "]  " + text;
+
+                        if (whisper_full_get_segment_speaker_turn_next(ctx, i)) {
+                            output += " [SPEAKER_TURN]";
+                        }
+
+                        output += "\n";
+
+                        printf("%s", output.c_str());
+                        fflush(stdout);
 
                         if (params.fname_out.length() > 0) {
-                            fout << "[" << to_timestamp(t0) << " --> " << to_timestamp(t1) << "]  " << text << std::endl;
+                            fout << output;
                         }
                     }
                 }
@@ -665,7 +384,7 @@ int main(int argc, char ** argv) {
                     fout << std::endl;
                 }
 
-                if (use_vad){
+                if (use_vad) {
                     printf("\n");
                     printf("### Transcription %d END\n", n_iter);
                 }
@@ -692,6 +411,7 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
+            fflush(stdout);
         }
     }
 

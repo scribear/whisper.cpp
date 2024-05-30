@@ -8,7 +8,10 @@ add_executable(${TARGET}
     emscripten.cpp
     )
 
+include(DefaultTargetOptions)
+
 target_link_libraries(${TARGET} PRIVATE
+    common
     whisper
     )
 

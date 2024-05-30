@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "common.h"
 #include "whisper.h"
 
 #include <emscripten.h>
@@ -27,90 +28,9 @@ std::string g_transcribed   = "";
 
 std::vector<float> g_pcmf32;
 
-static std::string trim(const std::string & s) {
-    std::regex e("^\\s+|\\s+$");
-    return std::regex_replace(s, e, "");
-}
-
-static void high_pass_filter(std::vector<float> & data, float cutoff, float sample_rate) {
-    const float rc = 1.0f / (2.0f * M_PI * cutoff);
-    const float dt = 1.0f / sample_rate;
-    const float alpha = dt / (rc + dt);
-
-    float y = data[0];
-
-    for (size_t i = 1; i < data.size(); i++) {
-        y = alpha * (y + data[i] - data[i - 1]);
-        data[i] = y;
-    }
-}
-
-// compute similarity between two strings using Levenshtein distance
-static float similarity(const std::string & s0, const std::string & s1) {
-    const size_t len0 = s0.size() + 1;
-    const size_t len1 = s1.size() + 1;
-
-    std::vector<int> col(len1, 0);
-    std::vector<int> prevCol(len1, 0);
-
-    for (size_t i = 0; i < len1; i++) {
-        prevCol[i] = i;
-    }
-
-    for (size_t i = 0; i < len0; i++) {
-        col[0] = i;
-        for (size_t j = 1; j < len1; j++) {
-            col[j] = std::min(std::min(1 + col[j - 1], 1 + prevCol[j]), prevCol[j - 1] + (s0[i - 1] == s1[j - 1] ? 0 : 1));
-        }
-        col.swap(prevCol);
-    }
-
-    const float dist = prevCol[len1 - 1];
-
-    return 1.0f - (dist / std::max(s0.size(), s1.size()));
-}
-
 void command_set_status(const std::string & status) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_status = status;
-}
-
-bool command_vad_simple(std::vector<float> & pcmf32, int sample_rate, int last_ms, float vad_thold, float freq_thold, bool verbose) {
-    const int n_samples      = pcmf32.size();
-    const int n_samples_last = (sample_rate * last_ms) / 1000;
-
-    if (n_samples_last >= n_samples) {
-        // not enough samples - assume no speech
-        return false;
-    }
-
-    if (freq_thold > 0.0f) {
-        high_pass_filter(pcmf32, freq_thold, sample_rate);
-    }
-
-    float energy_all  = 0.0f;
-    float energy_last = 0.0f;
-
-    for (size_t i = 0; i < n_samples; i++) {
-        energy_all += fabsf(pcmf32[i]);
-
-        if (i >= n_samples - n_samples_last) {
-            energy_last += fabsf(pcmf32[i]);
-        }
-    }
-
-    energy_all  /= n_samples;
-    energy_last /= n_samples_last;
-
-    if (verbose) {
-        fprintf(stderr, "%s: energy_all: %f, energy_last: %f, vad_thold: %f, freq_thold: %f\n", __func__, energy_all, energy_last, vad_thold, freq_thold);
-    }
-
-    if (energy_last > vad_thold*energy_all) {
-        return false;
-    }
-
-    return true;
 }
 
 std::string command_transcribe(whisper_context * ctx, const whisper_full_params & wparams, const std::vector<float> & pcmf32, float & prob, int64_t & t_ms) {
@@ -155,7 +75,7 @@ void command_get_audio(int ms, int sample_rate, std::vector<float> & audio) {
     const int64_t n_samples = (ms * sample_rate) / 1000;
 
     int64_t n_take = 0;
-    if (g_pcmf32.size() < n_samples) {
+    if (n_samples > (int) g_pcmf32.size()) {
         n_take = g_pcmf32.size();
     } else {
         n_take = n_samples;
@@ -187,7 +107,6 @@ void command_main(size_t index) {
 
     printf("command: using %d threads\n", wparams.n_threads);
 
-    bool is_running   = true;
     bool have_prompt  = false;
     bool ask_prompt   = true;
     bool print_energy = false;
@@ -233,7 +152,7 @@ void command_main(size_t index) {
         {
             command_get_audio(vad_ms, WHISPER_SAMPLE_RATE, pcmf32_cur);
 
-            if (command_vad_simple(pcmf32_cur, WHISPER_SAMPLE_RATE, 1000, vad_thold, freq_thold, print_energy)) {
+            if (::vad_simple(pcmf32_cur, WHISPER_SAMPLE_RATE, 1000, vad_thold, freq_thold, print_energy)) {
                 fprintf(stdout, "%s: Speech detected! Processing ...\n", __func__);
                 command_set_status("Speech detected! Processing ...");
 
@@ -324,7 +243,7 @@ EMSCRIPTEN_BINDINGS(command) {
     emscripten::function("init", emscripten::optional_override([](const std::string & path_model) {
         for (size_t i = 0; i < g_contexts.size(); ++i) {
             if (g_contexts[i] == nullptr) {
-                g_contexts[i] = whisper_init(path_model.c_str());
+                g_contexts[i] = whisper_init_from_file_with_params(path_model.c_str(), whisper_context_default_params());
                 if (g_contexts[i] != nullptr) {
                     g_running = true;
                     if (g_worker.joinable()) {

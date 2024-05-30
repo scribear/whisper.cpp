@@ -1,16 +1,14 @@
 // Talk with AI
 //
 
+#include "common-sdl.h"
+#include "common.h"
 #include "whisper.h"
 #include "gpt-2.h"
-
-#include <SDL.h>
-#include <SDL_audio.h>
 
 #include <cassert>
 #include <cstdio>
 #include <fstream>
-#include <mutex>
 #include <regex>
 #include <string>
 #include <thread>
@@ -33,13 +31,16 @@ struct whisper_params {
     bool print_special = false;
     bool print_energy  = false;
     bool no_timestamps = true;
+    bool use_gpu       = true;
+    bool flash_attn    = false;
 
     std::string person    = "Santa";
     std::string language  = "en";
     std::string model_wsp = "models/ggml-base.en.bin";
     std::string model_gpt = "models/ggml-gpt-2-117M.bin";
-    std::string speak     = "./examples/talk/speak.sh";
-    std::string fname_out = "";
+    std::string speak     = "./examples/talk/speak";
+    std::string speak_file= "./examples/talk/to_speak.txt";
+    std::string fname_out;
 };
 
 void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
@@ -63,11 +64,14 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
         else if (arg == "-tr"  || arg == "--translate")     { params.translate     = true; }
         else if (arg == "-ps"  || arg == "--print-special") { params.print_special = true; }
         else if (arg == "-pe"  || arg == "--print-energy")  { params.print_energy  = true; }
+        else if (arg == "-ng"  || arg == "--no-gpu")        { params.use_gpu       = false; }
+        else if (arg == "-fa"  || arg == "--flash-attn")    { params.flash_attn    = true; }
         else if (arg == "-p"   || arg == "--person")        { params.person        = argv[++i]; }
         else if (arg == "-l"   || arg == "--language")      { params.language      = argv[++i]; }
         else if (arg == "-mw"  || arg == "--model-whisper") { params.model_wsp     = argv[++i]; }
         else if (arg == "-mg"  || arg == "--model-gpt")     { params.model_gpt     = argv[++i]; }
         else if (arg == "-s"   || arg == "--speak")         { params.speak         = argv[++i]; }
+        else if (arg == "-sf"  || arg == "--speak_file")    { params.speak_file    = argv[++i]; }
         else if (arg == "-f"   || arg == "--file")          { params.fname_out     = argv[++i]; }
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
@@ -79,7 +83,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
     return true;
 }
 
-void whisper_print_usage(int argc, char ** argv, const whisper_params & params) {
+void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & params) {
     fprintf(stderr, "\n");
     fprintf(stderr, "usage: %s [options]\n", argv[0]);
     fprintf(stderr, "\n");
@@ -96,327 +100,16 @@ void whisper_print_usage(int argc, char ** argv, const whisper_params & params) 
     fprintf(stderr, "  -tr,      --translate     [%-7s] translate from source language to english\n",   params.translate ? "true" : "false");
     fprintf(stderr, "  -ps,      --print-special [%-7s] print special tokens\n",                        params.print_special ? "true" : "false");
     fprintf(stderr, "  -pe,      --print-energy  [%-7s] print sound energy (for debugging)\n",          params.print_energy ? "true" : "false");
+    fprintf(stderr, "  -ng,      --no-gpu        [%-7s] disable GPU\n",                                 params.use_gpu ? "false" : "true");
+    fprintf(stderr, "  -fa,      --flash-attn    [%-7s] flash attention\n",                             params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -p NAME,  --person NAME   [%-7s] person name (for prompt selection)\n",          params.person.c_str());
     fprintf(stderr, "  -l LANG,  --language LANG [%-7s] spoken language\n",                             params.language.c_str());
     fprintf(stderr, "  -mw FILE, --model-whisper [%-7s] whisper model file\n",                          params.model_wsp.c_str());
     fprintf(stderr, "  -mg FILE, --model-gpt     [%-7s] gpt model file\n",                              params.model_gpt.c_str());
     fprintf(stderr, "  -s FILE,  --speak TEXT    [%-7s] command for TTS\n",                             params.speak.c_str());
+    fprintf(stderr, "  -sf FILE, --speak_file    [%-7s] file to pass to TTS\n",                         params.speak_file.c_str());
     fprintf(stderr, "  -f FNAME, --file FNAME    [%-7s] text output file name\n",                       params.fname_out.c_str());
     fprintf(stderr, "\n");
-}
-
-//
-// SDL Audio capture
-//
-
-class audio_async {
-public:
-    audio_async(int len_ms);
-    ~audio_async();
-
-    bool init(int capture_id, int sample_rate);
-
-    // start capturing audio via the provided SDL callback
-    // keep last len_ms seconds of audio in a circular buffer
-    bool resume();
-    bool pause();
-    bool clear();
-
-    // callback to be called by SDL
-    void callback(uint8_t * stream, int len);
-
-    // get audio data from the circular buffer
-    void get(int ms, std::vector<float> & audio);
-
-private:
-    SDL_AudioDeviceID m_dev_id_in = 0;
-
-    int m_len_ms = 0;
-    int m_sample_rate = 0;
-
-    bool       m_running = false;
-    std::mutex m_mutex;
-
-    std::vector<float> m_audio;
-    std::vector<float> m_audio_new;
-    size_t             m_audio_pos = 0;
-    size_t             m_audio_len = 0;
-};
-
-audio_async::audio_async(int len_ms) {
-    m_len_ms = len_ms;
-}
-
-audio_async::~audio_async() {
-    if (m_dev_id_in) {
-        SDL_CloseAudioDevice(m_dev_id_in);
-    }
-}
-
-bool audio_async::init(int capture_id, int sample_rate) {
-    SDL_LogSetPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO);
-
-    if (SDL_Init(SDL_INIT_AUDIO) < 0) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Couldn't initialize SDL: %s\n", SDL_GetError());
-        return false;
-    }
-
-    SDL_SetHintWithPriority(SDL_HINT_AUDIO_RESAMPLING_MODE, "medium", SDL_HINT_OVERRIDE);
-
-    {
-        int nDevices = SDL_GetNumAudioDevices(SDL_TRUE);
-        fprintf(stderr, "%s: found %d capture devices:\n", __func__, nDevices);
-        for (int i = 0; i < nDevices; i++) {
-            fprintf(stderr, "%s:    - Capture device #%d: '%s'\n", __func__, i, SDL_GetAudioDeviceName(i, SDL_TRUE));
-        }
-    }
-
-    SDL_AudioSpec capture_spec_requested;
-    SDL_AudioSpec capture_spec_obtained;
-
-    SDL_zero(capture_spec_requested);
-    SDL_zero(capture_spec_obtained);
-
-    capture_spec_requested.freq     = sample_rate;
-    capture_spec_requested.format   = AUDIO_F32;
-    capture_spec_requested.channels = 1;
-    capture_spec_requested.samples  = 1024;
-    capture_spec_requested.callback = [](void * userdata, uint8_t * stream, int len) {
-        audio_async * audio = (audio_async *) userdata;
-        audio->callback(stream, len);
-    };
-    capture_spec_requested.userdata = this;
-
-    if (capture_id >= 0) {
-        fprintf(stderr, "%s: attempt to open capture device %d : '%s' ...\n", __func__, capture_id, SDL_GetAudioDeviceName(capture_id, SDL_TRUE));
-        m_dev_id_in = SDL_OpenAudioDevice(SDL_GetAudioDeviceName(capture_id, SDL_TRUE), SDL_TRUE, &capture_spec_requested, &capture_spec_obtained, 0);
-    } else {
-        fprintf(stderr, "%s: attempt to open default capture device ...\n", __func__);
-        m_dev_id_in = SDL_OpenAudioDevice(nullptr, SDL_TRUE, &capture_spec_requested, &capture_spec_obtained, 0);
-    }
-
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: couldn't open an audio device for capture: %s!\n", __func__, SDL_GetError());
-        m_dev_id_in = 0;
-
-        return false;
-    } else {
-        fprintf(stderr, "%s: obtained spec for input device (SDL Id = %d):\n", __func__, m_dev_id_in);
-        fprintf(stderr, "%s:     - sample rate:       %d\n",                   __func__, capture_spec_obtained.freq);
-        fprintf(stderr, "%s:     - format:            %d (required: %d)\n",    __func__, capture_spec_obtained.format,
-                capture_spec_requested.format);
-        fprintf(stderr, "%s:     - channels:          %d (required: %d)\n",    __func__, capture_spec_obtained.channels,
-                capture_spec_requested.channels);
-        fprintf(stderr, "%s:     - samples per frame: %d\n",                   __func__, capture_spec_obtained.samples);
-        fprintf(stderr, "\n");
-    }
-
-    m_sample_rate = capture_spec_obtained.freq;
-
-    m_audio.resize((m_sample_rate*m_len_ms)/1000);
-
-    return true;
-}
-
-bool audio_async::resume() {
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: no audio device to resume!\n", __func__);
-        return false;
-    }
-
-    if (m_running) {
-        fprintf(stderr, "%s: already running!\n", __func__);
-        return false;
-    }
-
-    SDL_PauseAudioDevice(m_dev_id_in, 0);
-
-    m_running = true;
-
-    return true;
-}
-
-bool audio_async::pause() {
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: no audio device to pause!\n", __func__);
-        return false;
-    }
-
-    if (!m_running) {
-        fprintf(stderr, "%s: already paused!\n", __func__);
-        return false;
-    }
-
-    SDL_PauseAudioDevice(m_dev_id_in, 1);
-
-    m_running = false;
-
-    return true;
-}
-
-bool audio_async::clear() {
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: no audio device to clear!\n", __func__);
-        return false;
-    }
-
-    if (!m_running) {
-        fprintf(stderr, "%s: not running!\n", __func__);
-        return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        m_audio_pos = 0;
-        m_audio_len = 0;
-    }
-
-    return true;
-}
-
-// callback to be called by SDL
-void audio_async::callback(uint8_t * stream, int len) {
-    if (!m_running) {
-        return;
-    }
-
-    const size_t n_samples = len / sizeof(float);
-
-    m_audio_new.resize(n_samples);
-    memcpy(m_audio_new.data(), stream, n_samples * sizeof(float));
-
-    //fprintf(stderr, "%s: %zu samples, pos %zu, len %zu\n", __func__, n_samples, m_audio_pos, m_audio_len);
-
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        if (m_audio_pos + n_samples > m_audio.size()) {
-            const size_t n0 = m_audio.size() - m_audio_pos;
-
-            memcpy(&m_audio[m_audio_pos], stream, n0 * sizeof(float));
-            memcpy(&m_audio[0], &stream[n0], (n_samples - n0) * sizeof(float));
-
-            m_audio_pos = (m_audio_pos + n_samples) % m_audio.size();
-            m_audio_len = m_audio.size();
-        } else {
-            memcpy(&m_audio[m_audio_pos], stream, n_samples * sizeof(float));
-
-            m_audio_pos = (m_audio_pos + n_samples) % m_audio.size();
-            m_audio_len = std::min(m_audio_len + n_samples, m_audio.size());
-        }
-    }
-}
-
-void audio_async::get(int ms, std::vector<float> & result) {
-    if (!m_dev_id_in) {
-        fprintf(stderr, "%s: no audio device to get audio from!\n", __func__);
-        return;
-    }
-
-    if (!m_running) {
-        fprintf(stderr, "%s: not running!\n", __func__);
-        return;
-    }
-
-    result.clear();
-
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        if (ms <= 0) {
-            ms = m_len_ms;
-        }
-
-        size_t n_samples = (m_sample_rate * ms) / 1000;
-        if (n_samples > m_audio_len) {
-            n_samples = m_audio_len;
-        }
-
-        result.resize(n_samples);
-
-        int s0 = m_audio_pos - n_samples;
-        if (s0 < 0) {
-            s0 += m_audio.size();
-        }
-
-        if (s0 + n_samples > m_audio.size()) {
-            const size_t n0 = m_audio.size() - s0;
-
-            memcpy(result.data(), &m_audio[s0], n0 * sizeof(float));
-            memcpy(&result[n0], &m_audio[0], (n_samples - n0) * sizeof(float));
-        } else {
-            memcpy(result.data(), &m_audio[s0], n_samples * sizeof(float));
-        }
-    }
-}
-
-///////////////////////////
-
-std::string trim(const std::string & s) {
-    std::regex e("^\\s+|\\s+$");
-    return std::regex_replace(s, e, "");
-}
-
-std::string replace(const std::string & s, const std::string & from, const std::string & to) {
-    std::string result = s;
-    size_t pos = 0;
-    while ((pos = result.find(from, pos)) != std::string::npos) {
-        result.replace(pos, from.length(), to);
-        pos += to.length();
-    }
-    return result;
-}
-
-void high_pass_filter(std::vector<float> & data, float cutoff, float sample_rate) {
-    const float rc = 1.0f / (2.0f * M_PI * cutoff);
-    const float dt = 1.0f / sample_rate;
-    const float alpha = dt / (rc + dt);
-
-    float y = data[0];
-
-    for (size_t i = 1; i < data.size(); i++) {
-        y = alpha * (y + data[i] - data[i - 1]);
-        data[i] = y;
-    }
-}
-
-bool vad_simple(std::vector<float> & pcmf32, int sample_rate, int last_ms, float vad_thold, float freq_thold, bool verbose) {
-    const int n_samples      = pcmf32.size();
-    const int n_samples_last = (sample_rate * last_ms) / 1000;
-
-    if (n_samples_last >= n_samples) {
-        // not enough samples - assume no speech
-        return false;
-    }
-
-    if (freq_thold > 0.0f) {
-        high_pass_filter(pcmf32, freq_thold, sample_rate);
-    }
-
-    float energy_all  = 0.0f;
-    float energy_last = 0.0f;
-
-    for (size_t i = 0; i < n_samples; i++) {
-        energy_all += fabsf(pcmf32[i]);
-
-        if (i >= n_samples - n_samples_last) {
-            energy_last += fabsf(pcmf32[i]);
-        }
-    }
-
-    energy_all  /= n_samples;
-    energy_last /= n_samples_last;
-
-    if (verbose) {
-        fprintf(stderr, "%s: energy_all: %f, energy_last: %f, vad_thold: %f, freq_thold: %f\n", __func__, energy_all, energy_last, vad_thold, freq_thold);
-    }
-
-    if (energy_last > vad_thold*energy_all) {
-        return false;
-    }
-
-    return true;
 }
 
 std::string transcribe(whisper_context * ctx, const whisper_params & params, const std::vector<float> & pcmf32, float & prob, int64_t & t_ms) {
@@ -497,8 +190,12 @@ int main(int argc, char ** argv) {
     }
 
     // whisper init
+    struct whisper_context_params cparams = whisper_context_default_params();
 
-    struct whisper_context * ctx_wsp = whisper_init(params.model_wsp.c_str());
+    cparams.use_gpu    = params.use_gpu;
+    cparams.flash_attn = params.flash_attn;
+
+    struct whisper_context * ctx_wsp = whisper_init_from_file_with_params(params.model_wsp.c_str(), cparams);
 
     // gpt init
 
@@ -541,7 +238,6 @@ int main(int argc, char ** argv) {
     bool force_speak = false;
 
     float prob0 = 0.0f;
-    float prob  = 0.0f;
 
     std::vector<float> pcmf32_cur;
     std::vector<float> pcmf32_prompt;
@@ -558,22 +254,10 @@ int main(int argc, char ** argv) {
     // main loop
     while (is_running) {
         // handle Ctrl + C
-        {
-            SDL_Event event;
-            while (SDL_PollEvent(&event)) {
-                switch (event.type) {
-                    case SDL_QUIT:
-                        {
-                            is_running = false;
-                        } break;
-                    default:
-                        break;
-                }
-            }
+        is_running = sdl_poll_events();
 
-            if (!is_running) {
-                break;
-            }
+        if (!is_running) {
+            break;
         }
 
         // delay
@@ -584,12 +268,12 @@ int main(int argc, char ** argv) {
         {
             audio.get(2000, pcmf32_cur);
 
-            if (vad_simple(pcmf32_cur, WHISPER_SAMPLE_RATE, 1250, params.vad_thold, params.freq_thold, params.print_energy) || force_speak) {
+            if (::vad_simple(pcmf32_cur, WHISPER_SAMPLE_RATE, 1250, params.vad_thold, params.freq_thold, params.print_energy) || force_speak) {
                 fprintf(stdout, "%s: Speech detected! Processing ...\n", __func__);
 
                 audio.get(params.voice_ms, pcmf32_cur);
 
-                std::string text_heard = "";
+                std::string text_heard;
 
                 if (!force_speak) {
                     text_heard = ::trim(::transcribe(ctx_wsp, params, pcmf32_cur, prob0, t_ms));
@@ -611,7 +295,7 @@ int main(int argc, char ** argv) {
                 text_heard = std::regex_replace(text_heard, std::regex("[^a-zA-Z0-9\\.,\\?!\\s\\:\\'\\-]"), "");
 
                 // take first line
-                text_heard = text_heard.substr(0, text_heard.find_first_of("\n"));
+                text_heard = text_heard.substr(0, text_heard.find_first_of('\n'));
 
                 // remove leading and trailing whitespace
                 text_heard = std::regex_replace(text_heard, std::regex("^\\s+"), "");
@@ -640,19 +324,19 @@ int main(int argc, char ** argv) {
                     std::string prompt = ::replace(::replace(k_prompt, "{0}", params.person), "{1}", prompt_base);
 
                     text_to_speak = gpt2_gen_text(ctx_gpt, prompt.c_str(), params.max_tokens);
-                    text_to_speak = std::regex_replace(text_to_speak, std::regex("[^a-zA-Z0-9\\.,\\?!\\s\\:\\'\\-]"), "");
-                    text_to_speak = text_to_speak.substr(0, text_to_speak.find_first_of("\n"));
+                    //text_to_speak = std::regex_replace(text_to_speak, std::regex("[^a-zA-Z0-9\\.,\\?!\\s\\:\\'\\-]"), "");
+                    text_to_speak = text_to_speak.substr(0, text_to_speak.find_first_of('\n'));
 
                     // remove first 2 lines of base prompt
                     if (n_iter > 4) {
                         {
-                            const size_t pos = prompt_base.find_first_of("\n");
+                            const size_t pos = prompt_base.find_first_of('\n');
                             if (pos != std::string::npos) {
                                 prompt_base = prompt_base.substr(pos + 1);
                             }
                         }
                         {
-                            const size_t pos = prompt_base.find_first_of("\n");
+                            const size_t pos = prompt_base.find_first_of('\n');
                             if (pos != std::string::npos) {
                                 prompt_base = prompt_base.substr(pos + 1);
                             }
@@ -678,7 +362,7 @@ int main(int argc, char ** argv) {
                 gpt2_set_prompt(ctx_gpt, prompt_base.c_str());
 
                 text_to_speak = ::replace(text_to_speak, params.person + ": ", "");
-                system((params.speak + " " + std::to_string(voice_id) + " \"" + text_to_speak + "\"").c_str());
+                speak_with_file(params.speak, text_to_speak, params.speak_file, voice_id);
 
                 audio.clear();
 
