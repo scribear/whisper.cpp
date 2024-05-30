@@ -95,3 +95,16 @@ This also causes issues with webpack, as emscripten does not expect the worker a
 On a side note, `SINGLE_FILE` option makes emscripten embed the `.wasm` file into the `.js` file as a blob, which also helps dealing with webpack.
 
 ## Building WASM whisper for ScribeAR
+
+To build a version of WASM whisper that could interface with ScribeAR (Or React.js + Webpack5 app in general), we need to make a few changes to the `CMakeLists.txt` scripts and to the compiled `.js` files:
+
+- Added `MODULARIZE`, `EXPORT_NAME`, and `EXPORT_ES6` to modularize whisper
+- Added `ENVIRONMENT=web,worker` to build for a browser environment (as opposed to backend node.js environment)
+- `coi-serviceworker.js` must be ran by the app for `SharedArrayBuffer` (we used an `useEffect` hook)
+- 
+
+To build whisper, go into `whisper.cpp/` and do:
+```
+mkdir build & cd build
+emcmake cmake ..
+```
