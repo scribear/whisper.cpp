@@ -30,6 +30,10 @@ endif()
 
 set_target_properties(${TARGET} PROPERTIES LINK_FLAGS " \
     --bind \
+    -s MODULARIZE=1 \
+    -s EXPORT_NAME='makeWhisper' \
+    -s EXPORT_ES6=1 \
+    -s ENVIRONMENT=web,worker \
     -s USE_PTHREADS=1 \
     -s PTHREAD_POOL_SIZE_STRICT=0 \
     -s INITIAL_MEMORY=2000MB \
