@@ -94,19 +94,34 @@ This also causes issues with webpack, as emscripten does not expect the worker a
 
 On a side note, `SINGLE_FILE` option makes emscripten embed the `.wasm` file into the `.js` file as a blob, which also helps dealing with webpack.
 
-## Building WASM whisper for ScribeAR
+## Building WASM Whisper for ScribeAR
 
-To build a version of WASM whisper that could interface with ScribeAR (Or React.js + Webpack5 app in general), we need to make a few changes to the `CMakeLists.txt` scripts and to the compiled `.js` files:
+You will need to first [download and install](https://emscripten.org/docs/getting_started/downloads.html) emscripten. You will also need cmake.
 
-- Added `MODULARIZE`, `EXPORT_NAME`, and `EXPORT_ES6` to modularize whisper
-- Added `ENVIRONMENT=web,worker` to build for a browser environment (as opposed to backend node.js environment)
-- `coi-serviceworker.js` must be ran by the app for `SharedArrayBuffer` (we used an `useEffect` hook)
-- 
-
-To build whisper, go into `whisper.cpp/` and do:
+This instance of Whisper is built from source code in `/examples/whisper.wasm`. Go into `whisper.cpp/` and do:
 ```
 mkdir build & cd build
 emcmake cmake ..
-make
+make libmain
 ```
-(WIP)
+This compiles whisper into `libmain.js` and `libmain.worker.js` in `build/bin` (`libmain.worker.js` is ran by the web worker). Copy them both into `src/components/api/whisper`.
+
+(If you are reading this guide for your own React project, make sure to **copy them into the same folder**. This is important because we will hardcode some relative paths in a moment which will break if they are in separate folders.)
+
+### What did we change to make WASM interface with React?
+
+We made a few changes to the `CMakeLists.txt` scripts to make the WASM whisper build interface with ScribeAR (Or React.js + Webpack5 app in general) properly.
+
+Changes to `/examples/whisper.wasm/CMakeLists.txt` :
+- Added `MODULARIZE`, `EXPORT_NAME='makeWhisper'`, and `EXPORT_ES6` to modularize whisper
+- Added `ENVIRONMENT=web,worker` to build for a browser environment (as opposed to backend node.js environment)
+
+Changes to ScribeAR:
+- `coi-serviceworker.js` was modified to be typescript compliant, and ran by the app to give us access to `SharedArrayBuffer` for threading
+- Adapter code in `index.html` is adopted into `whisperRecognizer` to instantiate and run the WASM module
+
+To elaborate on the last point, if you want to use `libmain.js` in your own project you need to do the following:
+- Import `makeWhisper` from `libmain.js`
+- The following functions are exposed by the WASM module to the js code: `init` for loading a ggml module into Whisper, and `full_default` for transcribing a piece of audio. You can find their signatures in the `emscripten.c` file in the `whisper.wasm` folder
+- To let the WASM module pass data (in particular transcript) back to the js code, redirect its stderr (see [above](#how-does-emscripten-work) to see how)
+- We recommend referring to `index.html` to see exactly how these functions are used to create a complete web app
