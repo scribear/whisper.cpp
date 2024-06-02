@@ -94,11 +94,11 @@ This also causes issues with webpack, as emscripten does not expect the worker a
 
 On a side note, `SINGLE_FILE` option makes emscripten embed the `.wasm` file into the `.js` file as a blob, which also helps dealing with webpack.
 
-## Building WASM whisper for ScribeAR
+## Building WASM Whisper for ScribeAR
 
 You will need to first [download and install](https://emscripten.org/docs/getting_started/downloads.html) emscripten. You will also need cmake.
 
-Go into `whisper.cpp/` and do:
+This instance of Whisper is built from source code in `/examples/whisper.wasm`. Go into `whisper.cpp/` and do:
 ```
 mkdir build & cd build
 emcmake cmake ..
@@ -118,3 +118,10 @@ Changes to `/examples/whisper.wasm/CMakeLists.txt` :
 
 Changes to ScribeAR:
 - `coi-serviceworker.js` was modified to be typescript compliant, and ran by the app to give us access to `SharedArrayBuffer` for threading
+- Adapter code in `index.html` is adopted into `whisperRecognizer` to instantiate and run the WASM module
+
+To elaborate on the last point, if you want to use `libmain.js` in your own project you need to do the following:
+- Import `makeWhisper` from `libmain.js`
+- The following functions are exposed by the WASM module to the js code: `init` for loading a ggml module into Whisper, and `full_default` for transcribing a piece of audio. You can find their signatures in the `emscripten.c` file in the `whisper.wasm` folder
+- To let the WASM module pass data (in particular transcript) back to the js code, redirect its stderr (see [above](#how-does-emscripten-work) to see how)
+- We recommend referring to `index.html` to see exactly how these functions are used to create a complete web app
