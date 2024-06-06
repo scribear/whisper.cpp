@@ -96,7 +96,11 @@ On a side note, `SINGLE_FILE` option makes emscripten embed the `.wasm` file int
 
 ## Building WASM Whisper for ScribeAR
 
-You will need to first [download and install](https://emscripten.org/docs/getting_started/downloads.html) emscripten. You will also need cmake.
+You will need both [emscripten sdk](https://emscripten.org/docs/getting_started/downloads.html) and cmake installed for this.
+
+We have adopted two implementations of WASM Whisper, whisper.wasm and stream.wasm in the examples folder for ScribeAR. The difference is that whisper.wasm only starts transcribing when stopped, while stream.wasm transcribes continuously once started.
+
+### Building whisper.wasm
 
 This instance of Whisper is built from source code in `/examples/whisper.wasm`. Go into `whisper.cpp/` and do:
 ```
@@ -108,6 +112,25 @@ This compiles whisper into `libmain.js` and `libmain.worker.js` in `build/bin` (
 
 (If you are reading this guide for your own React project, make sure to **copy them into the same folder**. This is important because we will hardcode some relative paths in a moment which will break if they are in separate folders.)
 
+### Building stream.wasm
+
+This instance of Whisper is built from source code in `/examples/stream.wasm`. Note that compared to whisper.wasm, the source code of stream.wasm has been modified heavily for optimization and experimental purposes. In particular, the JS part has been changed to use an AudioWorklet instead of MediaRecorder to capture audio continuously, and two custom data structures have been created to store audio.
+
+To build stream.wasm. Go into `whisper.cpp/` and do:
+```
+mkdir build & cd build
+emcmake cmake ..
+make libstream
+```
+This compiles whisper into `libstream.js` in `build/bin`. The following command then needs to be ran in `build/bin` to make Webpack handle `libstream.js` creating web workers correctly:
+
+```shell
+sed -i ""  "s/new Worker(new URL(/new Worker(new URL(\"libstream.js\", /" libstream.js
+```
+The file should then be copied into `src/components/api/whisper`.
+
+To test and debug `stream.wasm`, there is a fully functional demo website in `build/bin/stream.wasm`, which can be hosted by something like `live-server`.
+
 ### What did we change to make WASM interface with React?
 
 We made a few changes to the `CMakeLists.txt` scripts to make the WASM whisper build interface with ScribeAR (Or React.js + Webpack5 app in general) properly.
@@ -115,6 +138,11 @@ We made a few changes to the `CMakeLists.txt` scripts to make the WASM whisper b
 Changes to `/examples/whisper.wasm/CMakeLists.txt` :
 - Added `MODULARIZE`, `EXPORT_NAME='makeWhisper'`, and `EXPORT_ES6` to modularize whisper
 - Added `ENVIRONMENT=web,worker` to build for a browser environment (as opposed to backend node.js environment)
+
+Changes to `/examples/stream.wasm/CMakeLists.txt` :
+- Added `MODULARIZE`, `EXPORT_NAME='makeWhisper'`, and `EXPORT_ES6` to modularize whisper
+- Added `ENVIRONMENT=web,worker` to build for a browser environment (as opposed to backend node.js environment)
+- Added `add_custom_command` to copy all auxillary js files into the build directory after compiling the WASM module
 
 Changes to ScribeAR:
 - `coi-serviceworker.js` was modified to be typescript compliant, and ran by the app to give us access to `SharedArrayBuffer` for threading
@@ -125,3 +153,11 @@ To elaborate on the last point, if you want to use `libmain.js` in your own proj
 - The following functions are exposed by the WASM module to the js code: `init` for loading a ggml module into Whisper, and `full_default` for transcribing a piece of audio. You can find their signatures in the `emscripten.c` file in the `whisper.wasm` folder
 - To let the WASM module pass data (in particular transcript) back to the js code, redirect its stderr (see [above](#how-does-emscripten-work) to see how)
 - We recommend referring to `index.html` to see exactly how these functions are used to create a complete web app
+
+On the other hand, to use `libstream.js` in your own project, you need to do the following:
+- Import and call `makeWhisper` from `libstream.js`
+- To pass audio to the WASM module, call `set_audio` with a Float32Array containing the audio in 32 bit linear PCM format (the same format used by `AudioBuffer` in JS)
+- You can find more exposed functions in the `emscripten.c` file
+- Upon receiving audio, the module will immediately be waken up and transcribe the given audio (If audio exceed 30 seconds only the last 30 seconds will be used)
+- To receive data from the WASM module, redirect its stdout for transcripts and stderr for debug information
+- Again, we recommend referring to `index.html` AND the other js files in the `stream.wasm` folder to see how to collect audio and work with the module
