@@ -3,6 +3,7 @@
 
 #include <emscripten.h>
 #include <emscripten/bind.h>
+#include <emscripten/val.h>
 
 #include <atomic>
 #include <cmath>
@@ -13,24 +14,39 @@
 
 constexpr int N_THREAD = 8;
 
+// The following variables are SHARED between main and worker
+// Lock g_mutex before using them
+
+// Whisper contexts used by running whisper models
 std::vector<struct whisper_context *> g_contexts(4, nullptr);
-
-std::mutex g_mutex;
-std::thread g_worker;
-
-std::atomic<bool> g_running(false);
 
 std::string g_status        = "";
 std::string g_status_forced = "";
+
+// Transcript of the latest audio clip processed by whisper
 std::string g_transcribed   = "";
 
+// Buffer for the audio clip to be processed by whisper
 std::vector<float> g_pcmf32;
+
+// SHARED variables end here
+
+// The worker thread running whisper, and its mutex
+std::mutex g_mutex;
+std::thread g_worker;
+
+// Flag to make te worker thread stop
+std::atomic<bool> g_running(false);
 
 void stream_set_status(const std::string & status) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_status = status;
 }
 
+/**
+ * Main function of the worker thread which runs whisper model on the global audio buffer
+ * @param index 0-based index of the model's context
+ */
 void stream_main(size_t index) {
     stream_set_status("loading data ...");
 
@@ -64,12 +80,16 @@ void stream_main(size_t index) {
     // 5 seconds interval
     const int64_t window_samples = 5*WHISPER_SAMPLE_RATE;
 
+    // run whisper until flag tells us to stop
     while (g_running) {
         stream_set_status("waiting for audio ...");
 
+        // Grab audio from global buffer
         {
+            // Use unique_lock because we need to unlock mutex early sometimes
             std::unique_lock<std::mutex> lock(g_mutex);
 
+            // Lock mutex and check every ten ms whether the global audio buffer has enough data 
             if (g_pcmf32.size() < 1024) {
                 lock.unlock();
 
@@ -78,11 +98,14 @@ void stream_main(size_t index) {
                 continue;
             }
 
+            // Grab the last k samples from the global buffer and clear it
             pcmf32 = std::vector<float>(g_pcmf32.end() - std::min((int64_t) g_pcmf32.size(), window_samples), g_pcmf32.end());
             g_pcmf32.clear();
         }
 
+        // Run whisper on the audio
         {
+            // Time how long whisper takes, optional
             const auto t_start = std::chrono::high_resolution_clock::now();
 
             stream_set_status("running whisper ...");
@@ -95,9 +118,10 @@ void stream_main(size_t index) {
 
             const auto t_end = std::chrono::high_resolution_clock::now();
 
-            printf("stream: whisper_full() returned %d in %f seconds\n", ret, std::chrono::duration<double>(t_end - t_start).count());
+            printf("stream: whisper_full() processed %f seconds of audio and returned %d in %f seconds\n", ((float)pcmf32.size()) / WHISPER_SAMPLE_RATE, ret, std::chrono::duration<double>(t_end - t_start).count());
         }
 
+        // Grab the transcript from whisper's output
         {
             std::string text_heard;
 
@@ -106,7 +130,8 @@ void stream_main(size_t index) {
                 if (n_segments > 0) {
                     const char * text = whisper_full_get_segment_text(ctx, n_segments - 1);
 
-                    const int64_t t0 = whisper_full_get_segment_t0(ctx, n_segments - 1);
+                    // ??? Mysterious unused times
+                    const int64_t t0 = whisper_full_get_segment_t0(ctx, n_segments - 1); 
                     const int64_t t1 = whisper_full_get_segment_t1(ctx, n_segments - 1);
 
                     printf("transcribed: %s\n", text);
@@ -115,6 +140,7 @@ void stream_main(size_t index) {
                 }
             }
 
+            // Then update global transcript
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_transcribed = text_heard;
@@ -122,6 +148,7 @@ void stream_main(size_t index) {
         }
     }
 
+    // then free whisper
     if (index < g_contexts.size()) {
         whisper_free(g_contexts[index]);
         g_contexts[index] = nullptr;
@@ -129,12 +156,20 @@ void stream_main(size_t index) {
 }
 
 EMSCRIPTEN_BINDINGS(stream) {
+    /**
+     * Initialize a whisper model using the ggml file at the given path
+     * @param path_model Path to a ggml model file
+     * @returns Index of the created model (starting at 1), or 0 if the model could not be initialized
+     */
     emscripten::function("init", emscripten::optional_override([](const std::string & path_model) {
         for (size_t i = 0; i < g_contexts.size(); ++i) {
+            // Find the first null g_context
             if (g_contexts[i] == nullptr) {
+                // Load the given model into it
                 g_contexts[i] = whisper_init_from_file_with_params(path_model.c_str(), whisper_context_default_params());
                 if (g_contexts[i] != nullptr) {
                     g_running = true;
+                    // Wait for g_worker to finish, then create a new one running stream_main on i
                     if (g_worker.joinable()) {
                         g_worker.join();
                     }
@@ -158,7 +193,13 @@ EMSCRIPTEN_BINDINGS(stream) {
         }
     }));
 
+    /**
+     * Set the audio buffer of a given whisper model
+     * @param index 1-based index of the model
+     * @param audio Float32Array representing an audio clip
+     */
     emscripten::function("set_audio", emscripten::optional_override([](size_t index, const emscripten::val & audio) {
+        // the index given to the js code is 1-based, we need to make it 0-based first
         --index;
 
         if (index >= g_contexts.size()) {
@@ -171,15 +212,10 @@ EMSCRIPTEN_BINDINGS(stream) {
 
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            const int n = audio["length"].as<int>();
-
-            emscripten::val heap = emscripten::val::module_property("HEAPU8");
-            emscripten::val memory = heap["buffer"];
-
-            g_pcmf32.resize(n);
-
-            emscripten::val memoryView = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(g_pcmf32.data()), n);
-            memoryView.call<void>("set", audio);
+            // This is safe as g_pcmf is of type vector<float>, and audio is of type Float32Array
+            // Which yields typed_memory_view of the correct type
+            // See val.h for implementation of convertJSArrayToNumberVector
+            g_pcmf32 = emscripten::convertJSArrayToNumberVector<float>(audio);
         }
 
         return 0;
