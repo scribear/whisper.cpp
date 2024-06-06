@@ -1,14 +1,17 @@
 #include "ggml.h"
 #include "whisper.h"
 
+#include <cstdio>
 #include <emscripten.h>
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
 
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <mutex>
 #include <string>
+#include <stdio.h>
 #include <thread>
 #include <vector>
 
@@ -33,6 +36,7 @@ std::vector<float> g_pcmf32;
 
 // The worker thread running whisper, and its mutex
 std::mutex g_mutex;
+std::condition_variable g_cond;
 std::thread g_worker;
 
 // Flag to make te worker thread stop
@@ -70,15 +74,15 @@ void stream_main(size_t index) {
 
     wparams.language         = "en";
 
-    printf("stream: using %d threads\n", wparams.n_threads);
+    fprintf(stderr, "stream: using %d threads\n", wparams.n_threads);
 
     std::vector<float> pcmf32;
 
     // whisper context
     auto & ctx = g_contexts[index];
 
-    // 5 seconds interval
-    const int64_t window_samples = 5*WHISPER_SAMPLE_RATE;
+    // Process at most 30 seconds at a time
+    const int64_t window_samples = 30*WHISPER_SAMPLE_RATE;
 
     // run whisper until flag tells us to stop
     while (g_running) {
@@ -90,12 +94,8 @@ void stream_main(size_t index) {
             std::unique_lock<std::mutex> lock(g_mutex);
 
             // Lock mutex and check every ten ms whether the global audio buffer has enough data 
-            if (g_pcmf32.size() < 1024) {
-                lock.unlock();
-
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-                continue;
+            while (g_pcmf32.size() < 1024) {
+                g_cond.wait(lock);
             }
 
             // Grab the last k samples from the global buffer and clear it
@@ -112,13 +112,13 @@ void stream_main(size_t index) {
 
             int ret = whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size());
             if (ret != 0) {
-                printf("whisper_full() failed: %d\n", ret);
+                fprintf(stderr, "whisper_full() failed: %d\n", ret);
                 break;
             }
 
             const auto t_end = std::chrono::high_resolution_clock::now();
 
-            printf("stream: whisper_full() processed %f seconds of audio and returned %d in %f seconds\n", ((float)pcmf32.size()) / WHISPER_SAMPLE_RATE, ret, std::chrono::duration<double>(t_end - t_start).count());
+            fprintf(stderr, "stream: whisper_full() processed %f seconds of audio and returned %d in %f seconds\n", ((float)pcmf32.size()) / WHISPER_SAMPLE_RATE, ret, std::chrono::duration<double>(t_end - t_start).count());
         }
 
         // Grab the transcript from whisper's output
@@ -131,11 +131,10 @@ void stream_main(size_t index) {
                     const char * text = whisper_full_get_segment_text(ctx, n_segments - 1);
 
                     // ??? Mysterious unused times
-                    const int64_t t0 = whisper_full_get_segment_t0(ctx, n_segments - 1); 
-                    const int64_t t1 = whisper_full_get_segment_t1(ctx, n_segments - 1);
+                    // const int64_t t0 = whisper_full_get_segment_t0(ctx, n_segments - 1); 
+                    // const int64_t t1 = whisper_full_get_segment_t1(ctx, n_segments - 1);
 
-                    printf("transcribed: %s\n", text);
-
+                    fprintf(stdout, "%s\n", text); // The \n is needed to make emscripten output text to JS
                     text_heard += text;
                 }
             }
@@ -216,6 +215,7 @@ EMSCRIPTEN_BINDINGS(stream) {
             // Which yields typed_memory_view of the correct type
             // See val.h for implementation of convertJSArrayToNumberVector
             g_pcmf32 = emscripten::convertJSArrayToNumberVector<float>(audio);
+            g_cond.notify_all();
         }
 
         return 0;

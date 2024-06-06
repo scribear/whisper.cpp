@@ -26,9 +26,23 @@ if (WHISPER_WASM_SINGLE_FILE)
         ${CMAKE_BINARY_DIR}/bin/libstream.js
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/stream.wasm/stream.js
         )
+
+    add_custom_command(
+        TARGET ${TARGET} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_CURRENT_SOURCE_DIR}/circular-audio-buffer.js
+        ${CMAKE_CURRENT_SOURCE_DIR}/coi-serviceworker.js
+        ${CMAKE_CURRENT_SOURCE_DIR}/raw-recorder.js
+        ${CMAKE_CURRENT_SOURCE_DIR}/sipo-audio-buffer.js
+        -t ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/stream.wasm/
+        )
 endif()
 
 set_target_properties(${TARGET} PROPERTIES LINK_FLAGS " \
+    -s MODULARIZE \
+    -s EXPORT_NAME='makeWhisper' \
+    -s EXPORT_ES6 \
+    -s ENVIRONMENT=web,worker \
     --bind \
     -s USE_PTHREADS=1 \
     -s PTHREAD_POOL_SIZE=8 \

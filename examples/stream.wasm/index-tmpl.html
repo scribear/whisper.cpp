@@ -138,6 +138,13 @@
                     printTextarea('js: Initialized successfully!');
                 }
             };
+            import("./stream.js").then((result) => {
+                console.log("HEre be", result);
+                const makeWhisper = result.default;
+                return makeWhisper(Module);
+            }).then((result) => {
+                Module = result;
+            })
 
             //
             // fetch models
@@ -356,6 +363,5 @@
             }
 
         </script>
-        <script type="text/javascript" src="stream.js"></script>
     </body>
 </html>
