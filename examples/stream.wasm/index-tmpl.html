@@ -71,6 +71,7 @@
                 <button id="start"  onclick="onStart()" disabled>Start</button>
                 <button id="stop"   onclick="onStop()" disabled>Stop</button>
                 <button id="clear"  onclick="clearCache()">Clear Cache</button>
+                <button id="test"  onclick="test()">Start Test</button>
             </div>
 
             <br>
@@ -103,22 +104,18 @@
             <div class="cell-version">
                 <span>
                     |
-                    Build time: <span class="nav-link">@GIT_DATE@</span> |
-                    Commit hash: <a class="nav-link" href="https://github.com/ggerganov/whisper.cpp/commit/@GIT_SHA1@">@GIT_SHA1@</a> |
-                    Commit subject: <span class="nav-link">@GIT_COMMIT_SUBJECT@</span> |
+                    Build time: <span class="nav-link">Sun Jun 2 20:07:00 2024</span> |
+                    Commit hash: <a class="nav-link" href="https://github.com/ggerganov/whisper.cpp/commit/5f8d051a">5f8d051a</a> |
+                    Commit subject: <span class="nav-link">Elaborate more on using wasm in readme</span> |
                     <a class="nav-link" href="https://github.com/ggerganov/whisper.cpp/tree/master/examples/stream.wasm">Source Code</a> |
                 </span>
             </div>
         </div>
 
         <script type="text/javascript" src="helpers.js"></script>
+        <script type="text/javascript" src="coi-serviceworker.js"></script>
+        <script type="text/javascript" src="sipo-audio-buffer.js"></script>
         <script type='text/javascript'>
-            // web audio context
-            var context = null;
-
-            // audio data
-            var audio = null;
-            var audio0 = null;
 
             // the stream instance
             var instance = null;
@@ -221,140 +218,91 @@
                 loadRemote(url, dst, size_mb, cbProgress, storeFS, cbCancel, printTextarea);
             }
 
-            //
-            // microphone
-            //
-
-            const kSampleRate = 16000;
-            const kRestartRecording_s = 120;
-            const kIntervalAudio_ms = 5000; // pass the recorded audio to the C++ instance at this rate
-
-            var mediaRecorder = null;
-            var doRecording = false;
-            var startTime = 0;
-
+            // Polyfill
             window.AudioContext = window.AudioContext || window.webkitAudioContext;
             window.OfflineAudioContext = window.OfflineAudioContext || window.webkitOfflineAudioContext;
 
-            function stopRecording() {
-                Module.set_status("paused");
-                doRecording = false;
-                audio0 = null;
-                audio = null;
-                context = null;
-            }
+            //
+            // Audio params
+            //
+            const kSampleRate = 16000;
+            // Length of the suffix of the captured audio that whisper processes each time (in seconds)
+            const kWindowLength = 5;
+            // Number of samples in each audio chunk the audio worklet receives
+            const kChunkLength = 128;
+            const num_chunks = kWindowLength * kSampleRate / kChunkLength;
+            // // Circular buffer to store a fixed length suffix of the audio heard
+            let audio_buffer = new SIPOAudioBuffer(num_chunks, kChunkLength)
 
-            function startRecording() {
-                if (!context) {
-                    context = new AudioContext({
+            // web audio context
+            let context = new AudioContext({
                         sampleRate: kSampleRate,
                         channelCount: 1,
                         echoCancellation: false,
                         autoGainControl:  true,
                         noiseSuppression: true,
                     });
-                }
+            let source, raw_recorder;
+            // HACK: update audio of Module every k messages from raw_recorder 
+            let set_audio_counter = 0;
+            let set_audio_period = 50;
+            context.suspend();
+            navigator.mediaDevices.getUserMedia({audio: true, video: false})
+                .then((stream) => {
+                    source = context.createMediaStreamSource(stream);
+                    return context.audioWorklet.addModule("raw-recorder.js");
+                })
+                .then(() => {
+                    raw_recorder = new AudioWorkletNode(context, "raw-recorder");
+                    source.connect(raw_recorder);
+                    raw_recorder.connect(context.destination);
+
+                    raw_recorder.port.onmessage = (e) => {
+                        const audio_chunk = new Float32Array(e.data);
+                        audio_buffer.push(audio_chunk);
+                        if (audio_buffer.isFull()) {
+                            Module.set_audio(instance, audio_buffer.getAll());
+                            audio_buffer.clear();
+                            // play_audio_array(audio_buffer);
+                        }
+
+                    }
+                    console.log("Done setting up audio context");
+                })
+
+            function play_audio_array(array) {
+                let playback_context = new AudioContext();
+                let source = playback_context.createBufferSource();
+                source.buffer = playback_context.createBuffer(1, array.length, kSampleRate);
+                source.buffer.copyToChannel(array, 0);
+                source.connect(playback_context.destination);
+                source.start();
+            }
+
+
+            function stopRecording() {
+                Module.set_status("paused");
+
+                document.getElementById('start').disabled = false;
+                document.getElementById('stop').disabled = true;
+                
+                console.log("stopping context...");
+                context.suspend();
+                // play_audio_array(circular_buffer.getAll());
+                // Reset buffer, since what's in it would not be accurate once we restart
+                // circular_buffer.clear();
+                audio_buffer.clear();
+            }
+
+            function startRecording() {
 
                 Module.set_status("");
 
                 document.getElementById('start').disabled = true;
                 document.getElementById('stop').disabled = false;
 
-                doRecording = true;
-                startTime = Date.now();
-
-                var chunks = [];
-                var stream = null;
-
-                navigator.mediaDevices.getUserMedia({audio: true, video: false})
-                    .then(function(s) {
-                        stream = s;
-                        mediaRecorder = new MediaRecorder(stream);
-                        mediaRecorder.ondataavailable = function(e) {
-                            chunks.push(e.data);
-
-                            var blob = new Blob(chunks, { 'type' : 'audio/ogg; codecs=opus' });
-                            var reader = new FileReader();
-
-                            reader.onload = function(event) {
-                                var buf = new Uint8Array(reader.result);
-
-                                if (!context) {
-                                    return;
-                                }
-                                context.decodeAudioData(buf.buffer, function(audioBuffer) {
-                                    var offlineContext = new OfflineAudioContext(audioBuffer.numberOfChannels, audioBuffer.length, audioBuffer.sampleRate);
-                                    var source = offlineContext.createBufferSource();
-                                    source.buffer = audioBuffer;
-                                    source.connect(offlineContext.destination);
-                                    source.start(0);
-
-                                    offlineContext.startRendering().then(function(renderedBuffer) {
-                                        audio = renderedBuffer.getChannelData(0);
-
-                                        //printTextarea('js: audio recorded, size: ' + audio.length + ', old size: ' + (audio0 == null ? 0 : audio0.length));
-
-                                        var audioAll = new Float32Array(audio0 == null ? audio.length : audio0.length + audio.length);
-                                        if (audio0 != null) {
-                                            audioAll.set(audio0, 0);
-                                        }
-                                        audioAll.set(audio, audio0 == null ? 0 : audio0.length);
-
-                                        if (instance) {
-                                            Module.set_audio(instance, audioAll);
-                                        }
-                                    });
-                                }, function(e) {
-                                    audio = null;
-                                });
-                            }
-
-                            reader.readAsArrayBuffer(blob);
-                        };
-
-                        mediaRecorder.onstop = function(e) {
-                            if (doRecording) {
-                                setTimeout(function() {
-                                    startRecording();
-                                });
-                            }
-                        };
-
-                        mediaRecorder.start(kIntervalAudio_ms);
-                    })
-                    .catch(function(err) {
-                        printTextarea('js: error getting audio stream: ' + err);
-                    });
-
-                var interval = setInterval(function() {
-                    if (!doRecording) {
-                        clearInterval(interval);
-                        mediaRecorder.stop();
-                        stream.getTracks().forEach(function(track) {
-                            track.stop();
-                        });
-
-                        document.getElementById('start').disabled = false;
-                        document.getElementById('stop').disabled  = true;
-
-                        mediaRecorder = null;
-                    }
-
-                    // if audio length is more than kRestartRecording_s seconds, restart recording
-                    if (audio != null && audio.length > kSampleRate*kRestartRecording_s) {
-                        if (doRecording) {
-                            //printTextarea('js: restarting recording');
-
-                            clearInterval(interval);
-                            audio0 = audio;
-                            audio = null;
-                            mediaRecorder.stop();
-                            stream.getTracks().forEach(function(track) {
-                                track.stop();
-                            });
-                        }
-                    }
-                }, 100);
+                console.log("starting context...");
+                context.resume();
             }
 
             //
